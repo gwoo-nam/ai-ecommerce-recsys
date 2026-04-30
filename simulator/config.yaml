@@ -1,0 +1,39 @@
+# ---------------------------------------------------------
+# 시뮬레이터 동작 설정 (하드코딩 금지 요구사항 충족)
+# ---------------------------------------------------------
+
+# 트래픽 분배 비율 (기본 상태는 골고루, 트렌드 조작 시 '트렌드세터'를 높임)
+persona_ratios:
+  "트렌드세터": 0.80   # 청바지 트렌드 주입을 위해 극단적으로 상향
+  "실용주의자": 0.04
+  "가성비추구": 0.04
+  "브랜드충성": 0.04
+  "충동구매": 0.04
+  "신중탐색": 0.04
+
+# 페르소나별 상세 행동 확률 및 선호 타겟
+persona_configs:
+  "트렌드세터": 
+    view_to_cart: 0.8
+    cart_to_purchase: 0.9
+    target_category: "Jeans" # 이 타겟을 노림
+  "실용주의자": 
+    view_to_cart: 0.2
+    cart_to_purchase: 0.8
+    target_category: "Basic"
+  "가성비추구": 
+    view_to_cart: 0.15
+    cart_to_purchase: 0.9
+    target_category: "Sale"
+  "브랜드충성": 
+    view_to_cart: 0.4
+    cart_to_purchase: 0.7
+    target_category: "Premium"
+  "충동구매":   
+    view_to_cart: 0.6
+    cart_to_purchase: 0.6
+    target_category: "Accessories"
+  "신중탐색":   
+    view_to_cart: 0.05
+    cart_to_purchase: 0.2
+    target_category: "All"

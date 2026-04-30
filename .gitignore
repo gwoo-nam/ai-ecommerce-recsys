@@ -1,0 +1,14 @@
+# .gitignore
+
+# Python 관련
+__pycache__/
+*.py[cod]
+.env
+venv/
+.venv/
+
+# 데이터 관련 폴더 전체 제외 (대용량 파일 업로드 원천 차단)
+data/
+
+# Mac OS 임시 파일
+.DS_Store
