@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  # 1. Feature Store (Redis)
+  redis:
+    image: redis:alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  # 2. 멀티모달 & 추천 API 서버
+  api-server:
+    build: .
+    container_name: api-server
+    # uvicorn으로 FastAPI 서버 실행
+    command: uvicorn phase3_api_server:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    volumes:
+      - .:/app  # 로컬 데이터(csv, json) 변경사항을 실시간으로 공유
+
+  # 3. 평가 및 A/B 테스트 대시보드
+  dashboard:
+    build: .
+    container_name: dashboard
+    # streamlit으로 대시보드 실행
+    command: streamlit run phase4_dashboard.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api-server
+    volumes:
+      - .:/app
+
+  # 4. 고객 행동 시뮬레이터
+  simulator:
+    build: .
+    container_name: simulator
+    # 시뮬레이터 파이썬 파일 실행
+    command: python simulator.py
+    depends_on:
+      - api-server
+      - redis
+    volumes:
+      - .:/app

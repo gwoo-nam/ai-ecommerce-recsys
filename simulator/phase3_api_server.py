@@ -48,7 +48,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # [추가] Redis 인메모리 DB 연결 세팅 (실시간 세션 저장용)
 # ---------------------------------------------------------
 try:
-    redis_client = redis.Redis(host='127.0.0.1', port=6379, db=0, decode_responses=True)
+    redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
     redis_client.ping()
     print("✅ Redis 인메모리 DB 연결 성공!")
 except Exception as e:

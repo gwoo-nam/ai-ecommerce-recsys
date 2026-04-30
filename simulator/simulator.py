@@ -37,7 +37,7 @@ if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, "w", encoding="utf-8") as f:
         f.write("user_id,product_id,event_type,timestamp\n")
 
-API_URL = "http://127.0.0.1:8000/api/click"
+API_URL = "http://api-server:8000/api/click"
 log_count = 0
 
 print("🔥 [Simulator] 실시간 트래픽 생성을 시작합니다! (Ctrl+C로 중단)")
