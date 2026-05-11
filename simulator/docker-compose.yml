@@ -45,3 +45,14 @@ services:
       - redis
     volumes:
       - .:/app
+  # 5. Continuous Training 모니터 데몬
+  ct-monitor:
+    build: .
+    container_name: ct-monitor
+    command: python ct_pipeline.py
+    depends_on:
+      - api-server
+      - simulator
+    volumes:
+      - .:/app
+      

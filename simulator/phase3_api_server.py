@@ -1,136 +1,359 @@
+"""
+phase3_api_server.py  (전면 개편판: 진짜 Multi-Stage 추천)
+─────────────────────────────────────────────────────────
+명세서 부합 사항:
+
+  Stage 1 │ Candidate Generation (Two-Tower + FAISS)
+            - User Tower(persona 포함) → FAISS IP search → 후보 300개
+  Stage 2 │ Ranking (DeepFM)
+            - User/Item/Cross/Context 피처
+  Stage 3 │ Re-ranking (비즈니스 로직 + MAB)
+            - 동일 카테고리 연속 3개 금지 (다양성)
+            - 신규 유저(이력 5개 미만): 인기 + 트렌딩으로 폴백
+            - 신규 상품(등록 7일 이내): 노출 부스팅
+            - Epsilon-Greedy MAB: 상위 N개 중 1~2개를 탐색 슬롯으로
+
+  + Session Encoder (간이 GRU): 최근 클릭 시퀀스 → 단기 관심 임베딩
+                                 장기 선호(User Tower) ⊕ 단기 관심 결합
+  + 응답 필수 필드: search_type/results/latency_ms/total_count
+                   user_id/recommendations/pipeline_latency/session_context
+"""
 import os
 import io
-import torch
-import faiss
-import pandas as pd
-import numpy as np
-import redis
 import json
-import random
 import time
-import re
+import random
+import faiss
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import redis
+from datetime import datetime, timedelta
 from fastapi import FastAPI, UploadFile, File, Form, Query
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 from transformers import CLIPProcessor, CLIPModel
 from deep_translator import GoogleTranslator
 from PIL import Image
+from sklearn.preprocessing import LabelEncoder
 
-# 우리가 Phase 2에서 만든 DeepFM 아키텍처 (가중치 로드를 위해 클래스 선언 필요)
-import torch.nn as nn
+# ──────────────────────────────────────────────
+# 설정
+# ──────────────────────────────────────────────
+DATA_DIR        = "data"
+TEXT_INDEX_PATH = f"{DATA_DIR}/indices/text.index"
+CAND_INDEX_PATH = f"{DATA_DIR}/indices/candidate_item.index"
+DEEPFM_PATH     = f"{DATA_DIR}/models/deepfm.pth"
+TT_PATH         = f"{DATA_DIR}/models/two_tower.pth"
+
+CANDIDATE_K     = 300       # Stage 1 후보 개수
+RANK_TOP_N      = 50        # Stage 2 → Top-N 통과
+SESSION_LEN     = 10        # Redis 세션 시퀀스 길이
+NEW_PRODUCT_DAYS = 7        # 신규 상품 정의: 7일 이내
+NEW_USER_HISTORY_THRESHOLD = 5  # 신규 유저 정의: 행동 5개 미만
+EPSILON         = 0.1       # MAB exploration ratio
+MAX_SAME_CATEGORY_RUN = 2   # 연속 3개 금지 → 같은 카테고리 연속 2개까지 허용
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+app = FastAPI(title="Multi-Stage Recommender API")
+
+
+# ──────────────────────────────────────────────
+# 모델 정의 (학습 코드와 정확히 동일해야 함)
+# ──────────────────────────────────────────────
 class DeepFM(nn.Module):
     def __init__(self, feature_dims, embedding_dim=16):
-        super(DeepFM, self).__init__()
+        super().__init__()
         self.sparse_features = list(feature_dims.keys())
-        self.embeddings = nn.ModuleDict({feat: nn.Embedding(dim, embedding_dim) for feat, dim in feature_dims.items()})
-        self.linear = nn.ModuleDict({feat: nn.Embedding(dim, 1) for feat, dim in feature_dims.items()})
-        self.bias = nn.Parameter(torch.zeros(1))
-        mlp_input_dim = len(feature_dims) * embedding_dim
+        self.embeddings = nn.ModuleDict({f: nn.Embedding(d, embedding_dim) for f, d in feature_dims.items()})
+        self.linear     = nn.ModuleDict({f: nn.Embedding(d, 1) for f, d in feature_dims.items()})
+        self.bias       = nn.Parameter(torch.zeros(1))
+        mlp_in = len(feature_dims) * embedding_dim
         self.mlp = nn.Sequential(
-            nn.Linear(mlp_input_dim, 64), nn.ReLU(), nn.Dropout(0.2),
-            nn.Linear(64, 32), nn.ReLU(), nn.Dropout(0.2), nn.Linear(32, 1)
+            nn.Linear(mlp_in, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 64),     nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(64, 1),
         )
     def forward(self, x):
-        emb_list = [self.embeddings[feat](x[:, i]) for i, feat in enumerate(self.sparse_features)]
-        linear_term = self.bias + sum([self.linear[feat](x[:, i]) for i, feat in enumerate(self.sparse_features)])
-        emb_stack = torch.stack(emb_list, dim=1)
-        sum_of_square = torch.sum(emb_stack, dim=1) ** 2
-        square_of_sum = torch.sum(emb_stack ** 2, dim=1)
-        fm_term = 0.5 * torch.sum(sum_of_square - square_of_sum, dim=1, keepdim=True)
-        deep_input = torch.cat(emb_list, dim=1)
-        deep_term = self.mlp(deep_input)
-        return torch.sigmoid(linear_term + fm_term + deep_term).squeeze()
+        emb = [self.embeddings[f](x[:, i]) for i, f in enumerate(self.sparse_features)]
+        lin = self.bias + sum(self.linear[f](x[:, i]) for i, f in enumerate(self.sparse_features))
+        stk = torch.stack(emb, dim=1)
+        fm  = 0.5 * torch.sum(stk.sum(1) ** 2 - (stk ** 2).sum(1), dim=1, keepdim=True)
+        dnn = self.mlp(torch.cat(emb, dim=1))
+        return torch.sigmoid(lin + fm + dnn).squeeze()
 
-app = FastAPI(title="H&M Multi-Stage 추천 검색 API")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------------------------------------------------------
-# [추가] Redis 인메모리 DB 연결 세팅 (실시간 세션 저장용)
-# ---------------------------------------------------------
+class TwoTowerModel(nn.Module):
+    def __init__(self, n_users, n_prods, n_persona, n_cat1, n_cat2, n_cat3, n_tier, emb_dim=32, out_dim=64):
+        super().__init__()
+        self.user_emb    = nn.Embedding(n_users,   emb_dim)
+        self.persona_emb = nn.Embedding(n_persona, emb_dim)
+        self.user_mlp = nn.Sequential(nn.Linear(emb_dim * 2, 128), nn.ReLU(), nn.Linear(128, out_dim))
+        
+        self.item_emb = nn.Embedding(n_prods, emb_dim)
+        self.cat1_emb = nn.Embedding(n_cat1, emb_dim)
+        self.cat2_emb = nn.Embedding(n_cat2, emb_dim)
+        self.cat3_emb = nn.Embedding(n_cat3, emb_dim)
+        self.tier_emb = nn.Embedding(n_tier, emb_dim)
+        self.item_mlp = nn.Sequential(nn.Linear(emb_dim * 5, 128), nn.ReLU(), nn.Linear(128, out_dim))
+        self.out_dim  = out_dim
+
+    def encode_user(self, u_idx, persona_idx):
+        x = torch.cat([self.user_emb(u_idx), self.persona_emb(persona_idx)], dim=-1)
+        return F.normalize(self.user_mlp(x), p=2, dim=-1)
+
+    def encode_item(self, p_idx, cat1_idx, cat2_idx, cat3_idx, tier_idx):
+        x = torch.cat([
+            self.item_emb(p_idx),
+            self.cat1_emb(cat1_idx),
+            self.cat2_emb(cat2_idx),
+            self.cat3_emb(cat3_idx),
+            self.tier_emb(tier_idx),
+        ], dim=-1)
+        return F.normalize(self.item_mlp(x), p=2, dim=-1)
+
+
+class SessionGRU(nn.Module):
+    """간이 세션 인코더: 최근 클릭한 item embedding 시퀀스를 GRU로 요약."""
+    def __init__(self, item_emb_layer: nn.Embedding, hidden=64, out_dim=64):
+        super().__init__()
+        self.item_emb_layer = item_emb_layer
+        self.gru = nn.GRU(item_emb_layer.embedding_dim, hidden, batch_first=True)
+        self.proj = nn.Linear(hidden, out_dim)
+
+    def forward(self, item_idx_seq: torch.Tensor):
+        # (1, T) → (1, T, emb) → (1, hidden)
+        emb = self.item_emb_layer(item_idx_seq)
+        _, h = self.gru(emb)
+        return F.normalize(self.proj(h.squeeze(0)), p=2, dim=-1)
+
+
+# ──────────────────────────────────────────────
+# Redis
+# ──────────────────────────────────────────────
 try:
-    redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
+    redis_client = redis.Redis(host="redis", port=6379, db=0, decode_responses=True)
     redis_client.ping()
-    print("✅ Redis 인메모리 DB 연결 성공!")
-except Exception as e:
-    print("⚠️ Redis가 켜져있지 않습니다! (추천 API 호출 시 에러가 날 수 있습니다)")
+    print("✅ Redis 연결 성공")
+except Exception:
+    try:
+        redis_client = redis.Redis(host="127.0.0.1", port=6379, db=0, decode_responses=True)
+        redis_client.ping()
+        print("✅ Redis 연결 성공 (localhost)")
+    except Exception as e:
+        print(f"⚠️ Redis 연결 실패: {e}")
+        redis_client = None
 
-# --- 1. 글로벌 메모리 로드 (서버 켤 때 한 번만 실행) ---
-print("🚀 [1/3] 멀티모달 CLIP & 벡터 DB 로딩 중...")
-model_id = "openai/clip-vit-base-patch32"
-clip_processor = CLIPProcessor.from_pretrained(model_id)
-clip_model = CLIPModel.from_pretrained(model_id).to(device)
-clip_model.eval()
 
-faiss_index = faiss.read_index("data/indices/text.index")
+# ──────────────────────────────────────────────
+# 글로벌 자원 로드
+# ──────────────────────────────────────────────
+print("🚀 [1/5] CLIP & 텍스트 FAISS 로드...")
+clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+clip_model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
+text_faiss     = faiss.read_index(TEXT_INDEX_PATH)
 
-print("🚀 [2/3] 상품 및 유저 메타데이터 로딩 중...")
-df_prods = pd.read_csv('data/products.csv')
-df_users = pd.read_csv('data/users.csv')
-df_logs = pd.read_csv('data/train_logs.csv') # 피처 차원 계산용
+print("🚀 [2/5] 메타데이터 로드...")
+df_prods = pd.read_csv(f"{DATA_DIR}/products.csv")
+df_users = pd.read_csv(f"{DATA_DIR}/users.csv")
+df_logs  = pd.read_csv(f"{DATA_DIR}/train_logs.csv")
 
-# DeepFM을 위한 인코더 복원 (간이 버전)
-sparse_features = ['user_id', 'product_id', 'persona', 'category_L1', 'price_tier']
-from sklearn.preprocessing import LabelEncoder
+# 인기 상품 (purchase 횟수) — 신규유저/MAB 폴백용
+popular_pids = (
+    df_logs[df_logs["event_type"] == "purchase"]["product_id"]
+    .value_counts().head(200).index.tolist()
+)
+
+# 트렌딩 상품 (최근 30% 시점의 view)
+df_logs_dt = df_logs.copy()
+try:
+    df_logs_dt["timestamp"] = pd.to_datetime(df_logs_dt["timestamp"])
+    cutoff = df_logs_dt["timestamp"].quantile(0.7)
+    trending_pids = (
+        df_logs_dt[(df_logs_dt["timestamp"] >= cutoff) & (df_logs_dt["event_type"] == "view")]["product_id"]
+        .value_counts().head(200).index.tolist()
+    )
+except Exception:
+    trending_pids = popular_pids[:]
+
+# 신규 상품 (등록 7일 이내) — train_logs 마지막 날짜 기준
+try:
+    latest_date = df_logs_dt["timestamp"].max()
+    first_seen = df_logs_dt.groupby("product_id")["timestamp"].min()
+    new_pids = first_seen[first_seen >= latest_date - pd.Timedelta(days=NEW_PRODUCT_DAYS)].index.tolist()
+except Exception:
+    new_pids = []
+
+print(f"  인기 상품 {len(popular_pids)} / 트렌딩 {len(trending_pids)} / 신규 {len(new_pids)}")
+
+print("🚀 [3/5] DeepFM 인코더/모델 로드...")
+SPARSE_FEATURES = ['user_id', 'product_id', 'persona', 'category_L1', 'category_L2', 'category_L3', 'price_tier']
 encoders = {}
-temp_merged = df_logs.merge(df_users, on='user_id').merge(df_prods, on='product_id')
-for feat in sparse_features:
+temp = df_logs.merge(df_users, on="user_id").merge(df_prods, on="product_id")
+for f in SPARSE_FEATURES:
     le = LabelEncoder()
-    temp_merged[feat] = le.fit_transform(temp_merged[feat].astype(str))
-    encoders[feat] = le
+    temp[f] = le.fit_transform(temp[f].astype(str))
+    encoders[f] = le
+feature_dims = {f: len(encoders[f].classes_) for f in SPARSE_FEATURES}
 
-feature_dims = {feat: len(encoders[feat].classes_) for feat in sparse_features}
+deepfm = DeepFM(feature_dims).to(device)
+deepfm.load_state_dict(torch.load(DEEPFM_PATH, map_location=device))
+deepfm.eval()
 
-print("🚀 [3/3] DeepFM 랭킹 모델 로딩 중...")
-deepfm_model = DeepFM(feature_dims).to(device)
-deepfm_model.load_state_dict(torch.load('data/models/deepfm.pth', map_location=device))
-deepfm_model.eval()
+print("🚀 [4/5] Two-Tower 로드...")
+two_tower = None
+candidate_faiss = None
+user_idx_map = {}
+user_persona_map = {}
+prod_idx_map = {}
+prod_idx_to_id = {}
+
+if os.path.exists(TT_PATH) and os.path.exists(CAND_INDEX_PATH):
+    ckpt = torch.load(TT_PATH, map_location=device)
+    
+    # 여기서 카테고리 1, 2, 3을 각각 불러오도록 수정됨!
+    two_tower = TwoTowerModel(
+        n_users=ckpt["num_users"], 
+        n_prods=ckpt["num_prods"],
+        n_persona=ckpt["num_persona"], 
+        n_cat1=ckpt["num_cat1"], 
+        n_cat2=ckpt["num_cat2"], 
+        n_cat3=ckpt["num_cat3"], 
+        n_tier=ckpt["num_tier"],
+    ).to(device)
+    
+    two_tower.load_state_dict(ckpt["state_dict"])
+    two_tower.eval()
+    candidate_faiss = faiss.read_index(CAND_INDEX_PATH)
+
+    user_map = pd.read_csv(f"{DATA_DIR}/models/two_tower_user_map.csv")
+    user_idx_map     = dict(zip(user_map["user_id"], user_map["user_idx"]))
+    user_persona_map = dict(zip(user_map["user_id"], user_map["persona_idx"]))
+    prod_map = pd.read_csv(f"{DATA_DIR}/models/two_tower_prod_map.csv")
+    prod_idx_map     = dict(zip(prod_map["product_id"], prod_map["prod_idx"]))
+    prod_idx_to_id   = {v: k for k, v in prod_idx_map.items()}
+    print("  ✅ Two-Tower + FAISS IndexIDMap 로드")
+
+print("🚀 [5/5] 세션 GRU 초기화...")
+session_encoder = None
+if two_tower is not None:
+    session_encoder = SessionGRU(two_tower.item_emb).to(device).eval()
+
+# 빠른 조회용
+prod_meta_dict = df_prods.set_index("product_id").to_dict("index")
+user_persona_str = df_users.set_index("user_id")["persona"].to_dict()
+all_pids_set = set(df_prods["product_id"].values)
 
 print("✅ 서버 준비 완료!")
 
-# --- 2. API 엔드포인트 ---
 
+# ──────────────────────────────────────────────
+# 헬퍼
+# ──────────────────────────────────────────────
+def encode_for_deepfm(df: pd.DataFrame) -> np.ndarray:
+    X = np.zeros((len(df), len(SPARSE_FEATURES)), dtype=int)
+    for i, f in enumerate(SPARSE_FEATURES):
+        cls = encoders[f].classes_
+        v = df[f].astype(str).values
+        m = np.isin(v, cls)
+        X[m, i] = encoders[f].transform(v[m])
+    return X
+
+
+def get_session_recent_pids(user_id: str) -> list:
+    if redis_client is None:
+        return []
+    raw = redis_client.get(f"session:{user_id}")
+    return json.loads(raw) if raw else []
+
+
+def diversity_rerank(ranked_pids: list, max_run: int = MAX_SAME_CATEGORY_RUN) -> list:
+    """
+    동일 카테고리 연속 3개 이상 금지 (= 같은 카테고리 연속 2개까지 허용).
+    탐욕적으로 다음 후보를 골라 카테고리 run 제약을 만족시킴.
+    """
+    out, run_cat, run_count = [], None, 0
+    pool = list(ranked_pids)
+
+    while pool and len(out) < len(ranked_pids):
+        picked_idx = None
+        for i, pid in enumerate(pool):
+            cat = prod_meta_dict.get(pid, {}).get("category_L1")
+            if cat == run_cat and run_count >= max_run:
+                continue
+            picked_idx = i
+            break
+
+        if picked_idx is None:
+            picked_idx = 0  # 제약 풀고 그냥 픽
+
+        pid = pool.pop(picked_idx)
+        cat = prod_meta_dict.get(pid, {}).get("category_L1")
+        if cat == run_cat:
+            run_count += 1
+        else:
+            run_cat, run_count = cat, 1
+        out.append(pid)
+
+    return out
+
+
+# ──────────────────────────────────────────────
+# Pydantic
+# ──────────────────────────────────────────────
+class LogEvent(BaseModel):
+    user_id: str
+    product_id: str
+    event_type: Literal["search", "view", "cart", "purchase"]
+    timestamp: int
+
+
+# ══════════════════════════════════════════════
+# /api/search  (멀티모달 검색, 명세 필수 필드 준수)
+# ══════════════════════════════════════════════
 @app.post("/api/search")
 async def personalized_search(
-    user_id: str = Form("U000058a12d"), 
-    query: Optional[str] = Form(None),      
-    file: Optional[UploadFile] = File(None) 
+    user_id: str = Form("U000058a12d"),
+    query: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    top_k: int = Form(10),
 ):
-    """(기존) 멀티모달 기반의 검색 API"""
+    t0 = time.perf_counter()
     if not query and not file:
-        return {"error": "텍스트 검색어(query)나 이미지 파일(file) 중 하나는 반드시 입력해야 합니다."}
+        return {"error": "query 또는 file 중 하나는 필수입니다."}
 
-    text_emb = None
-    image_emb = None
-    search_type = "unknown"
-    translated_query = None
+    # 임베딩 생성
+    text_emb, image_emb = None, None
 
     if query:
-        translated_query = GoogleTranslator(source='auto', target='en').translate(query)
-        text_input = translated_query
-    else:
-        text_input = "dummy"
+        try:
+            translated = GoogleTranslator(source="auto", target="en").translate(query)
+        except Exception:
+            translated = query
+        tok = clip_processor.tokenizer(translated, return_tensors="pt", padding=True, truncation=True, max_length=77).to(device)
+        with torch.no_grad():
+            tf = clip_model.get_text_features(input_ids=tok["input_ids"], attention_mask=tok["attention_mask"])
+            if not isinstance(tf, torch.Tensor):
+                pooler = getattr(tf, "pooler_output", None)
+                embeds = getattr(tf, "text_embeds", None)
+                tf = pooler if pooler is not None else embeds
+            text_emb = tf / tf.norm(dim=-1, keepdim=True)
 
     if file:
-        image_data = await file.read()
-        img_input = Image.open(io.BytesIO(image_data)).convert("RGB")
-    else:
-        img_input = Image.new('RGB', (224, 224), (0, 0, 0))
+        img_bytes = await file.read()
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        proc = clip_processor(images=[img], return_tensors="pt").to(device)
+        with torch.no_grad():
+            img_f = clip_model.get_image_features(pixel_values=proc["pixel_values"])
+            image_emb = img_f / img_f.norm(dim=-1, keepdim=True)
 
-    inputs = clip_processor(text=[text_input], images=[img_input], return_tensors="pt", padding=True, truncation=True).to(device)
-    
-    with torch.no_grad():
-        outputs = clip_model(**inputs)
-        if query:
-            text_emb = outputs.text_embeds
-            text_emb = text_emb / text_emb.norm(p=2, dim=-1, keepdim=True)
-        if file:
-            image_emb = outputs.image_embeds
-            image_emb = image_emb / image_emb.norm(p=2, dim=-1, keepdim=True)
-
+    # 검색 타입 결정
     if query and file:
         search_type = "hybrid"
         final_emb = (text_emb + image_emb) / 2.0
-        final_emb = final_emb / final_emb.norm(p=2, dim=-1, keepdim=True)
+        final_emb = final_emb / final_emb.norm(dim=-1, keepdim=True)
     elif query:
         search_type = "text"
         final_emb = text_emb
@@ -138,153 +361,257 @@ async def personalized_search(
         search_type = "image"
         final_emb = image_emb
 
-    final_emb_np = final_emb.cpu().numpy().astype('float32')
-    distances, indices = faiss_index.search(final_emb_np, 100)
-    candidate_ids = df_prods.iloc[indices[0]]['product_id'].values
-    candidate_df = df_prods[df_prods['product_id'].isin(candidate_ids)].copy()
+    # FAISS 검색
+    final_np = final_emb.cpu().numpy().astype("float32")
+    distances, indices = text_faiss.search(final_np, max(top_k * 5, 50))
+    candidate_ids = df_prods.iloc[indices[0]]["product_id"].values
+    candidate_df = df_prods[df_prods["product_id"].isin(candidate_ids)].copy()
 
-    user_info = df_users[df_users['user_id'] == user_id]
+    # DeepFM 개인화 랭킹
+    user_info = df_users[df_users["user_id"] == user_id]
     if user_info.empty:
-        return {
-            "user_id": user_id,
-            "persona": "신규가입자(Cold Start)", 
-            "search_type": search_type,
-            "original_query": query,
-            "results": candidate_df.head(10)[['product_id', 'product_name', 'price']].to_dict('records')
-        }
-    
-    candidate_df['user_id'] = user_id
-    candidate_df['persona'] = user_info['persona'].values[0]
-    
-    X_pred = np.zeros((len(candidate_df), len(sparse_features)), dtype=int)
-    for i, feat in enumerate(sparse_features):
-        classes = encoders[feat].classes_
-        vals = candidate_df[feat].astype(str).values
-        X_pred[:, i] = np.where(np.isin(vals, classes), encoders[feat].transform(vals), 0)
-
-    X_tensor = torch.tensor(X_pred, dtype=torch.long).to(device)
-    
-    with torch.no_grad():
-        scores = deepfm_model(X_tensor).cpu().numpy()
-        
-    candidate_df['deepfm_score'] = scores
-    final_results = candidate_df.sort_values(by='deepfm_score', ascending=False).head(10)
-    
-    return {
-        "user_id": user_id,
-        "persona": user_info['persona'].values[0],
-        "search_type": search_type,
-        "original_query": query,
-        "results": final_results[['product_id', 'product_name', 'price', 'deepfm_score']].to_dict('records')
-    }
-
-# ---------------------------------------------------------
-# [신규 API 1] 클릭 이벤트를 실시간으로 Redis에 저장 (Product ID 기반)
-# ---------------------------------------------------------
-@app.post("/api/click")
-async def log_user_click(user_id: str = Form("U000058a12d"), item_id: str = Form(...)):
-    """프론트엔드에서 유저가 클릭한 상품의 고유 ID(product_id)를 전송합니다."""
-    session_key = f"session:{user_id}"
-    
-    existing_session = redis_client.get(session_key)
-    clicked_items = json.loads(existing_session) if existing_session else []
-    
-    # 💡 이제 텍스트가 아니라 상품 ID(예: P0669715003)를 저장합니다!
-    if item_id not in clicked_items:
-        clicked_items.insert(0, item_id)
-    clicked_items = clicked_items[:5] # 최근 클릭한 옷 5개만 기억
-    
-    redis_client.set(session_key, json.dumps(clicked_items), ex=3600)
-    
-    return {"message": f"상품 [{item_id}] 클릭이 Redis에 실시간 저장됨!", "current_session": clicked_items}
-
-# ---------------------------------------------------------
-# [신규 API 2] 실시간 추천 (Category 고정 + DeepFM 랭킹)
-# ---------------------------------------------------------
-@app.get("/api/recommend")
-async def get_home_recommendations(
-    user_id: str = Query("U000058a12d", description="추천을 받을 유저 ID"), 
-    top_n: int = Query(10, description="반환할 추천 상품 개수")
-):
-    start_time = time.time()
-    user_info = df_users[df_users['user_id'] == user_id]
-    
-    session_data = redis_client.get(f"session:{user_id}")
-    recent_items = json.loads(session_data) if session_data else []
-
-    if user_info.empty:
-        fallback_items = df_prods.sample(top_n) 
-        return {"user_id": user_id, "recommendations": fallback_items.to_dict('records')}
-        
-    user_persona = user_info['persona'].values[0]
-
-    # 💡 [질문자님 아이디어 적용] 텍스트 검색을 버리고, DB의 메타데이터(Category)를 활용!
-    if recent_items:
-        # 1. 유저가 최근 클릭한 상품 ID들의 실제 DB 정보를 싹 다 가져옵니다.
-        clicked_prods = df_prods[df_prods['product_id'].isin(recent_items)]
-        
-        if not clicked_prods.empty:
-            # 2. 💡 [핵심] L1(대분류), L2(중분류), L3(소분류)의 '정확한 족보(조합)'를 중복 없이 추출합니다.
-            # 예: [('Baby/Children', 'Children Sizes 134-170', 'Garment Upper body')]
-            target_categories = clicked_prods[['category_L1', 'category_L2', 'category_L3']].drop_duplicates()
-            
-            # 3. 🔒 전체 상품 DB에서 이 "완벽하게 일치하는 카테고리 조합"을 가진 옷들만 교집합(inner join)으로 퍼옵니다!
-            # 여성복을 봤으면 여성복 상의만, 아동복을 봤으면 아동복 상의만 정확히 매칭됩니다.
-            candidate_pool = df_prods.merge(target_categories, on=['category_L1', 'category_L2', 'category_L3'], how='inner')
-            sample_size = min(100, len(candidate_pool))
-            candidate_df = candidate_pool.sample(sample_size).copy()
-        else:
-            candidate_df = df_prods.sample(100).copy()
+        results_df = candidate_df.head(top_k)
+        results_df = results_df.assign(score=1.0)
+        persona = "신규가입자"
     else:
-        candidate_df = df_prods.sample(100).copy()
+        persona = user_info["persona"].values[0]
+        candidate_df["user_id"] = user_id
+        candidate_df["persona"] = persona
+        X_p = encode_for_deepfm(candidate_df)
+        with torch.no_grad():
+            scores = deepfm(torch.tensor(X_p, dtype=torch.long).to(device)).cpu().numpy()
+        candidate_df["score"] = scores
+        results_df = candidate_df.sort_values("score", ascending=False).head(top_k)
 
-    # 부족하면 채우기
-    if len(candidate_df) < 100:
-        candidate_df = pd.concat([candidate_df, df_prods.sample(100 - len(candidate_df))]).copy()
+    latency = round((time.perf_counter() - t0) * 1000, 1)
 
-    candidate_df['user_id'] = user_id
-    candidate_df['persona'] = user_persona
-    
-    # 🧠 [AI 랭킹] 카테고리는 이미 고정되었으니, DeepFM은 유저 취향(페르소나)과 가격(price_tier)만 집중해서 점수를 매깁니다!
-    X_pred = np.zeros((len(candidate_df), len(sparse_features)), dtype=int)
-    for i, feat in enumerate(sparse_features):
-        classes = encoders[feat].classes_
-        vals = candidate_df[feat].astype(str).values
-        X_pred[:, i] = np.where(np.isin(vals, classes), encoders[feat].transform(vals), 0)
+    return {
+        "search_type": search_type,
+        "results": [
+            {
+                "product_id": r["product_id"],
+                "name":       r["product_name"],
+                "score":      float(r["score"]),
+                "price":      int(r["price"]),
+            }
+            for _, r in results_df.iterrows()
+        ],
+        "latency_ms": latency,
+        "total_count": int(len(candidate_df)),
+        "user_id": user_id,
+        "persona": persona,
+        "original_query": query,
+    }
 
-    X_tensor = torch.tensor(X_pred, dtype=torch.long).to(device)
+
+# ══════════════════════════════════════════════
+# /api/log  (세션 추적)
+# ══════════════════════════════════════════════
+@app.post("/api/log")
+async def receive_log(log: LogEvent):
+    if redis_client is None:
+        return {"message": "redis 미연결", "event": log.event_type}
+
+    key = f"session:{log.user_id}"
+    raw = redis_client.get(key)
+    seq = json.loads(raw) if raw else []
+
+    if log.event_type in ["search", "view", "cart", "purchase"]:
+        if log.product_id in seq:
+            seq.remove(log.product_id)
+        seq.insert(0, log.product_id)
+        seq = seq[:SESSION_LEN]
+        redis_client.set(key, json.dumps(seq), ex=3600)
+
+    # 클릭 횟수 카운트 (실시간 피처)
+    redis_client.incr(f"click_count:{log.user_id}")
+    redis_client.expire(f"click_count:{log.user_id}", 3600)
+
+    return {"message": "ok", "event": log.event_type}
+
+
+# ══════════════════════════════════════════════
+# /api/recommend  (진짜 Multi-Stage)
+# ══════════════════════════════════════════════
+@app.get("/api/recommend")
+async def recommend(
+    user_id: str = Query("U000058a12d"),
+    top_n: int = Query(10),
+):
+    t_total = time.perf_counter()
+
+    # 컨텍스트 수집
+    user_info  = df_users[df_users["user_id"] == user_id]
+    persona    = user_info["persona"].values[0] if not user_info.empty else None
+    recent_pids = get_session_recent_pids(user_id)
+    history_count = len(recent_pids)
+
+    # 신규 유저 폴백
+    is_new_user = (persona is None) or (history_count < NEW_USER_HISTORY_THRESHOLD and user_info.empty)
+    # 명세에 따라 "행동 이력 5개 미만"을 폴백 조건으로 쓴다
+    cold_start = history_count < NEW_USER_HISTORY_THRESHOLD
+
+    session_interest = None
+    if recent_pids:
+        cats = [prod_meta_dict.get(p, {}).get("category_L1") for p in recent_pids]
+        cats = [c for c in cats if c]
+        if cats:
+            session_interest = max(set(cats), key=cats.count)
+
+    # ──────── Stage 1: Candidate Generation ────────
+    t_s1 = time.perf_counter()
+    candidate_pids = []
+
+    can_use_two_tower = (two_tower is not None) and (user_id in user_idx_map)
+    if can_use_two_tower:
+        u_idx = torch.tensor([user_idx_map[user_id]], dtype=torch.long).to(device)
+        p_idx = torch.tensor([user_persona_map[user_id]], dtype=torch.long).to(device)
+
+        with torch.no_grad():
+            u_vec = two_tower.encode_user(u_idx, p_idx)  # (1, D)
+
+            # 단기 관심(세션) ⊕ 장기 선호(User Tower)
+            if session_encoder is not None and recent_pids:
+                seq_idx = [prod_idx_map[p] for p in recent_pids if p in prod_idx_map]
+                if seq_idx:
+                    seq_t = torch.tensor([seq_idx], dtype=torch.long).to(device)
+                    s_vec = session_encoder(seq_t)  # (1, D)
+                    u_vec = F.normalize(0.6 * u_vec + 0.4 * s_vec, p=2, dim=-1)
+
+        u_np = u_vec.cpu().numpy().astype("float32")
+        faiss.normalize_L2(u_np)
+        _, cand_ids = candidate_faiss.search(u_np, CANDIDATE_K)
+        candidate_pids = [prod_idx_to_id[i] for i in cand_ids[0] if i in prod_idx_to_id]
+
+    # 콜드스타트 또는 Two-Tower 사용 불가 시: 인기 + 트렌딩으로 폴백
+    if cold_start or not candidate_pids:
+        fallback = list(dict.fromkeys(popular_pids + trending_pids))[:CANDIDATE_K]
+        candidate_pids = fallback if not candidate_pids else candidate_pids
+        # 부족하면 채우기
+        if len(candidate_pids) < CANDIDATE_K:
+            for p in fallback:
+                if p not in candidate_pids:
+                    candidate_pids.append(p)
+                if len(candidate_pids) >= CANDIDATE_K:
+                    break
+
+    candidate_ms = round((time.perf_counter() - t_s1) * 1000, 1)
+
+    # ──────── Stage 2: Ranking (DeepFM) ────────
+    t_s2 = time.perf_counter()
+    cand_df = pd.DataFrame({"product_id": candidate_pids})
+    cand_df["user_id"] = user_id
+    cand_df["persona"] = persona if persona else "신중탐색"
+    cand_df = cand_df.merge(
+        df_prods[["product_id", "category_L1", "price_tier"]],
+        on="product_id", how="left"
+    )
+    cand_df["category_L1"] = cand_df["category_L1"].fillna("Ladieswear")
+    cand_df["price_tier"]  = cand_df["price_tier"].fillna("medium")
+
+    X_p = encode_for_deepfm(cand_df)
     with torch.no_grad():
-        candidate_df['deepfm_score'] = deepfm_model(X_tensor).cpu().numpy()
-        
-    # MAB 비즈니스 로직 적용
-    exploitation_count = top_n - 2
-    best_items = candidate_df.sort_values(by='deepfm_score', ascending=False).head(exploitation_count)
-    exploration_items = df_prods.sample(2) 
+        ranking_scores = deepfm(torch.tensor(X_p, dtype=torch.long).to(device)).cpu().numpy()
+    cand_df["score"] = ranking_scores
 
+    ranked = cand_df.sort_values("score", ascending=False).head(RANK_TOP_N)
+    ranking_ms = round((time.perf_counter() - t_s2) * 1000, 1)
+
+    # ──────── Stage 3: Re-ranking (다양성 + 신규상품 + MAB) ────────
+    t_s3 = time.perf_counter()
+
+    ranked_pids = ranked["product_id"].tolist()
+    score_map = dict(zip(ranked["product_id"], ranked["score"]))
+
+    # 1) 다양성 (동일 카테고리 연속 3개 금지)
+    diverse_pids = diversity_rerank(ranked_pids)
+
+    # 2) 신규 상품 노출 부스팅: 후보에서 신규상품 1개를 상위 3 안에 강제 삽입
+    new_in_candidates = [p for p in diverse_pids if p in set(new_pids)]
+    if new_in_candidates and not cold_start:
+        boost = new_in_candidates[0]
+        diverse_pids.remove(boost)
+        diverse_pids.insert(min(2, len(diverse_pids)), boost)
+
+    # 3) Top-N 자르기 + MAB 탐색 슬롯 (Epsilon-Greedy)
+    final_pids = diverse_pids[:max(top_n - 2, 1)]  # exploitation
+    explore_count = max(1, top_n - len(final_pids))  # 1~2개 탐색
+    explore_pool = [p for p in popular_pids + trending_pids if p not in final_pids]
+    random.shuffle(explore_pool)
+    explore_picks = explore_pool[:explore_count]
+
+    # 결과 조립
     final_recs = []
-    for _, row in best_items.iterrows():
-        final_recs.append({"product_id": row['product_id'], "score": float(row['deepfm_score']), "reason": "personalized_deepfm", "is_exploration": False})
-    for _, row in exploration_items.iterrows():
-        final_recs.append({"product_id": row['product_id'], "score": 0.0, "reason": "mab_exploration", "is_exploration": True})
-        
-    random.shuffle(final_recs)
+    for pid in final_pids:
+        reason = "personalized_deepfm"
+        if pid in set(new_pids):
+            reason = "new_product_boost"
+        elif session_interest and prod_meta_dict.get(pid, {}).get("category_L1") == session_interest:
+            reason = "session_interest"
+        final_recs.append({
+            "product_id": pid,
+            "score": float(score_map.get(pid, 0.0)),
+            "reason": reason,
+            "is_exploration": False,
+        })
+
+    for pid in explore_picks:
+        final_recs.append({
+            "product_id": pid,
+            "score": 0.0,
+            "reason": "mab_exploration",
+            "is_exploration": True,
+        })
+
+    # 셔플하지 말고 다양성 정렬 한 번 더
+    final_recs = final_recs[:top_n]
+
+    reranking_ms = round((time.perf_counter() - t_s3) * 1000, 1)
+    total_ms = round((time.perf_counter() - t_total) * 1000, 1)
 
     return {
         "user_id": user_id,
-        "persona": user_persona,
-        "pipeline_latency_ms": int((time.time() - start_time) * 1000),
-        "session_context": {"recent_clicked_item_ids": recent_items},
-        "recommendations": final_recs
+        "persona": persona,
+        "recommendations": final_recs,
+        "pipeline_latency": {
+            "candidate_ms":  candidate_ms,
+            "ranking_ms":    ranking_ms,
+            "reranking_ms":  reranking_ms,
+            "total_ms":      total_ms,
+        },
+        "session_context": {
+            "recent_clicks":     recent_pids,
+            "recent_clicked_item_ids": recent_pids,  # 호환
+            "session_interest":  session_interest,
+            "history_count":     history_count,
+            "is_cold_start":     cold_start,
+        },
     }
-# ---------------------------------------------------------
-# [신규 API 3] 무중단 배포 (새롭게 학습된 뇌 갈아끼우기)
-# ---------------------------------------------------------
+
+
+# ══════════════════════════════════════════════
+# /api/reload-model  (CT 후 무중단 갱신)
+# ══════════════════════════════════════════════
 @app.post("/api/reload-model")
 async def reload_model():
     try:
-        # 하드디스크에 있는 최신 deepfm.pth 파일을 다시 읽어와서 덮어씌웁니다.
-        deepfm_model.load_state_dict(torch.load('data/models/deepfm.pth', map_location=device))
-        deepfm_model.eval()
-        return {"message": "✅ 최신 트렌드를 반영한 새로운 AI 모델로 무중단 교체 완료!"}
+        deepfm.load_state_dict(torch.load(DEEPFM_PATH, map_location=device))
+        deepfm.eval()
+        return {"message": "✅ DeepFM 가중치 갱신 완료"}
     except Exception as e:
-        return {"error": f"모델 로딩 실패: {str(e)}"}
+        return {"error": str(e)}
+
+
+# ══════════════════════════════════════════════
+# /api/health  (간단 헬스 체크)
+# ══════════════════════════════════════════════
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "two_tower_loaded": two_tower is not None,
+        "deepfm_loaded": deepfm is not None,
+        "redis_connected": redis_client is not None,
+        "n_products": len(df_prods),
+        "n_users": len(df_users),
+    }

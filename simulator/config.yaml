@@ -1,6 +1,19 @@
 # ---------------------------------------------------------
-# 시뮬레이터 동작 설정 (하드코딩 금지 요구사항 충족)
+# 시뮬레이터 동작 설정 (H&M 데이터셋 카테고리 기준)
 # ---------------------------------------------------------
+#
+# 변경 요지:
+#   - target_category 를 H&M 의 실제 컬럼(category_L1 / L3) 기반으로 매칭
+#   - 상품명 부분문자열 매칭은 0건이 되는 키워드가 많아 폐기
+#   - 페르소나별 카테고리 선호가 데이터에 실제로 반영되도록 조정
+#
+# H&M data 의 실제 분포 (참고):
+#   category_L1: Ladieswear, Menswear, Baby/Children, Sport, Divided
+#   category_L3 (product_group_name): Garment Upper body, Trousers, Accessories,
+#                                     Shoes, Underwear, Socks & Tights, ...
+
+api:
+  log_endpoint: "http://api-server:8000/api/log"
 
 # 트래픽 분배 비율 (현실적인 고객 분포)
 persona_ratios:
@@ -11,32 +24,58 @@ persona_ratios:
   "충동구매":   0.10
   "신중탐색":   0.10
 
-# 페르소나별 상세 행동 확률 및 선호 타겟
-# view_to_cart   : 한 번의 트래픽이 'cart' 또는 'purchase'로 기록될 확률
-# cart_to_purchase: 위 cart 중 'purchase'로 한 번 더 진행될 확률
-# 결과적으로 실제 CVR ≈ view_to_cart × cart_to_purchase
+# 페르소나별 상세 설정
+#   match_field      : 매칭할 컬럼 (category_L1 | category_L3 | product_name | any)
+#   match_values     : 해당 컬럼에서 일치할 값 리스트 (대소문자 무시, 부분일치)
+#   view_to_cart     : view 이벤트가 cart 로 전환될 확률
+#   cart_to_purchase : cart 가 purchase 로 전환될 확률 → CVR ≈ 두 값의 곱
+#   search_prob      : 세션 시작 시 search 이벤트가 발생할 확률
+#   price_sensitivity: high → low tier 우선 / low → medium·high tier 우선 / medium → 필터 없음
 persona_configs:
   "트렌드세터":
-    view_to_cart: 0.15        # 15% 가 cart 단계 진입
-    cart_to_purchase: 0.40    # 그 중 40% 가 구매 → 실제 CVR ≈ 6%
-    target_category: "Jeans"
+    match_field: "category_L3"
+    match_values: ["Trousers", "Garment Upper body"]   # 청바지/상의 트렌드
+    view_to_cart: 0.15
+    cart_to_purchase: 0.40       # CVR ≈ 6%
+    search_prob: 0.60
+    price_sensitivity: "medium"
+
   "실용주의자":
+    match_field: "category_L3"
+    match_values: ["Garment Upper body", "Underwear", "Socks & Tights"]  # 베이직/실용
     view_to_cart: 0.08
-    cart_to_purchase: 0.50    # CVR ≈ 4%
-    target_category: "Basic"
+    cart_to_purchase: 0.50       # CVR ≈ 4%
+    search_prob: 0.50
+    price_sensitivity: "medium"
+
   "가성비추구":
+    match_field: "any"           # 카테고리 무관, 가격대로만 필터
+    match_values: []
     view_to_cart: 0.10
-    cart_to_purchase: 0.50    # CVR ≈ 5%
-    target_category: "Sale"
+    cart_to_purchase: 0.50       # CVR ≈ 5%
+    search_prob: 0.70
+    price_sensitivity: "high"    # low tier 우선
+
   "브랜드충성":
+    match_field: "category_L1"
+    match_values: ["Ladieswear", "Menswear"]   # 메인 라인 위주
     view_to_cart: 0.12
-    cart_to_purchase: 0.45    # CVR ≈ 5.4%
-    target_category: "Premium"
+    cart_to_purchase: 0.45       # CVR ≈ 5.4%
+    search_prob: 0.30
+    price_sensitivity: "low"     # medium/high tier 우선
+
   "충동구매":
+    match_field: "category_L3"
+    match_values: ["Accessories", "Bags", "Shoes"]
     view_to_cart: 0.20
-    cart_to_purchase: 0.30    # CVR ≈ 6%
-    target_category: "Accessories"
+    cart_to_purchase: 0.30       # CVR ≈ 6%
+    search_prob: 0.20
+    price_sensitivity: "medium"
+
   "신중탐색":
+    match_field: "any"           # 전체 탐색
+    match_values: []
     view_to_cart: 0.05
-    cart_to_purchase: 0.20    # CVR ≈ 1%
-    target_category: "All"
+    cart_to_purchase: 0.20       # CVR ≈ 1%
+    search_prob: 0.80
+    price_sensitivity: "high"

@@ -37,7 +37,7 @@ def trigger_retraining():
 
         # 💡 [여기 추가] 학습 끝나자마자 API 서버 찔러서 뇌 교체하기!
         try:
-            response = requests.post("http://127.0.0.1:8000/api/reload-model")
+            response = requests.post("http://api-server:8000/api/reload-model")
             print(f"🔄 API 서버 뇌 교체 완료: {response.json().get('message', '성공')}")
         except Exception as e:
             print(f"⚠️ API 갱신 실패 (서버가 켜져있는지 확인하세요): {e}")

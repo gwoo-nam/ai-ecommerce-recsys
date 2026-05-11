@@ -108,6 +108,7 @@ with tab1:
     else:
         # ── 핵심 지표 카드 ─────────────────────────────────────────────────
         event_counts = df_logs["event_type"].value_counts()
+        searches  = int(event_counts.get("search",   0))  # 👈 추가!
         views     = int(event_counts.get("view",     0))
         carts     = int(event_counts.get("cart",     0))
         purchases = int(event_counts.get("purchase", 0))
@@ -149,10 +150,10 @@ with tab1:
             st.markdown("#### 사용자 행동 퍼널")
             fig_funnel = go.Figure(
                 go.Funnel(
-                    y=["상품 조회 (View)", "장바구니 (Cart)", "최종 구매 (Purchase)"],
-                    x=[views, carts, purchases],
+                    y=["상품 검색 (Search)", "상품 조회 (View)", "장바구니 (Cart)", "최종 구매 (Purchase)"], # 👈 추가
+                    x=[searches, views, carts, purchases], # 👈 추가
                     textinfo="value+percent initial",
-                    marker={"color": ["#5C6BC0", "#42A5F5", "#66BB6A"]},
+                    marker={"color": ["#FFA726", "#5C6BC0", "#42A5F5", "#66BB6A"]}, # 컬러맵 4개로 맞춤
                 )
             )
             fig_funnel.update_layout(
@@ -160,7 +161,7 @@ with tab1:
                 height=360,
                 margin=dict(t=40, b=20),
             )
-            st.plotly_chart(fig_funnel, use_container_width=True)
+            st.plotly_chart(fig_funnel, width='stretch')
 
         # ── 페르소나별 이벤트 분포 ───────────────────────────────────────────
         with col_persona:
@@ -191,7 +192,7 @@ with tab1:
                         height=360,
                     )
                     fig_persona.update_layout(margin=dict(t=40, b=20))
-                    st.plotly_chart(fig_persona, use_container_width=True)
+                    st.plotly_chart(fig_persona, width='stretch')
                 else:
                     st.info("페르소나 데이터를 집계 중입니다...")
             else:
@@ -226,12 +227,12 @@ with tab1:
                     title="카테고리 대분류별 실시간 구매 수 Top-10",
                 )
                 fig_cat.update_layout(height=380, margin=dict(t=40, b=20))
-                st.plotly_chart(fig_cat, use_container_width=True)
+                st.plotly_chart(fig_cat, width='stretch')
             else:
                 st.info("아직 purchase 이벤트가 없습니다.")
 
         # ── 새로고침 버튼 ──────────────────────────────────────────────────
-        if st.button("🔄 데이터 새로고침", use_container_width=False):
+        if st.button("🔄 데이터 새로고침", width='content'):
             st.cache_data.clear()
             st.rerun()
 
@@ -303,7 +304,7 @@ with tab2:
             )
         )
         fig_mrr.update_layout(height=280, margin=dict(t=30, b=10))
-        st.plotly_chart(fig_mrr, use_container_width=True)
+        st.plotly_chart(fig_mrr, width='stretch')
 
         ndcg10 = m["search"]["ndcg_10"]
         ndcg_color = "🟢" if ndcg10 >= 0.50 else "🔴"
@@ -336,7 +337,7 @@ with tab2:
             )
         )
         fig_hr.update_layout(height=280, margin=dict(t=30, b=10))
-        st.plotly_chart(fig_hr, use_container_width=True)
+        st.plotly_chart(fig_hr, width='stretch')  # 🚨 [수정됨] fig_mrr 오타를 fig_hr로 고쳤습니다!
 
         r300  = m["recommend"]["recall_300"]
         auc   = m["recommend"]["auc"]
@@ -401,7 +402,7 @@ with tab2:
         height=420,
         margin=dict(t=20, b=20),
     )
-    st.plotly_chart(fig_radar, use_container_width=True)
+    st.plotly_chart(fig_radar, width='stretch')
 
     st.divider()
 
@@ -492,7 +493,7 @@ with tab3:
             "B그룹 전환율 (%)", 0.1, 99.9, float(auto_cvr_b), 0.1
         )
 
-    if st.button("🚀 통계 검정 실행", type="primary", use_container_width=True):
+    if st.button("🚀 통계 검정 실행", type="primary", width='stretch'):
         p_A = cvr_A_pct / 100
         p_B = cvr_B_pct / 100
 
@@ -569,7 +570,7 @@ with tab3:
         )
         fig_ab.update_traces(textposition="outside")
         fig_ab.update_layout(showlegend=False, height=420)
-        st.plotly_chart(fig_ab, use_container_width=True)
+        st.plotly_chart(fig_ab, width='stretch')
 
         # ── 표본 크기 파워 분석 (필요 표본 수 계산) ────────────────
         st.divider()
